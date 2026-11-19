@@ -28,6 +28,13 @@ import torch.nn.functional as F
 from config import GDN_QUANT, Qwen38Config
 
 REF_DTYPE = torch.float64
+MAX_THREADS = 32
+
+
+def host_torch_setup() -> None:
+    """Limit CPU reference threads and disable oneDNN."""
+    torch.set_num_threads(min(torch.get_num_threads(), MAX_THREADS))
+    torch.backends.mkldnn.enabled = False
 
 
 # ---------------------------------------------------------------------------
@@ -168,21 +175,6 @@ def quantize_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 def dequantize(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """int8 rows times their fp32 scale, in float64: exact, the integers being small."""
     return q.to(REF_DTYPE) * scale.to(REF_DTYPE)[:, None]
-
-
-def quantize_weights(w: dict[str, torch.Tensor],
-                     names: tuple[str, ...] = GDN_QUANT.weights) -> dict[str, torch.Tensor]:
-    """The int8 form of a weight set: *names* replaced by int8, `<module>.weight_scale` added.
-
-    Everything else passes through. The scale's name follows the W8A8 checkpoint
-    convention (`weight_scale` beside `weight`), so a converted checkpoint's
-    tensors take the same keys.
-    """
-    out = dict(w)
-    for name in names:
-        assert name.endswith(".weight"), name
-        out[name], out[name[: -len("weight")] + "weight_scale"] = quantize_rows(w[name])
-    return out
 
 
 def weight(w: dict[str, torch.Tensor], module: str) -> torch.Tensor:

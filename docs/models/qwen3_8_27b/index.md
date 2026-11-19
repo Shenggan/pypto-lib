@@ -325,7 +325,7 @@ the block output sits 3e-3 to 7e-3 from the float64 chain, which is the
 yardstick for what a device-side block can be held to.
 
 The block chain is two references in one. On bf16 weights it is the float64
-truth above. On int8 weights (`reference.quantize_weights`, the same
+truth above. On int8 weights (`weights.quantize_weights`, the same
 per-output-channel chain `models/qwen3_14b` and `models/deepseek_v4_pro` use)
 with per-token quantisation of the hidden states and of the normed output, it
 is the W8A8 chain the projection kernels will implement, with their exact

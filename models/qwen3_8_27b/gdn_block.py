@@ -91,7 +91,11 @@ def build_kernel(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, hg: int = HG, d: int
     key_width = hg * d
 
     op_quant = quant_x.build_kernel(t=t, inline=True)
-    op_qkv = in_proj_qkv.build_kernel(t=t, inline=True, row_off=k - 1)
+    op_qkv = a8w8_linear.build_kernel(
+        t, c, cqkv, name=in_proj_qkv.MODULE, inline=True, row_off=k - 1,
+        m_tile=in_proj_qkv.M_TILE, n_tile=in_proj_qkv.N_TILE, k_tile=in_proj_qkv.K_TILE,
+        m_group=in_proj_qkv.M_GROUP, n_group=in_proj_qkv.N_GROUP,
+    )
     op_z = in_proj_z.build_kernel(t=t, inline=True)
     op_ab = in_proj_ab.build_kernel(t=t, inline=True)
     conv = dict(t=t, c=cqkv, k=k, inline=True)
@@ -183,23 +187,17 @@ def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, hg: int = HG, 
     from golden import TensorSpec
 
     import reference
+    from weights import load_weights, quantized_weight, stacked_ab_weight
 
     def block_weights():
-        if weights is None:
-            return reference.make_block_weights(QWEN3_8_27B)
-        return torch.load(weights, weights_only=True)
+        return load_weights(QWEN3_8_27B, weights)
 
-    def quantized(module):
-        q, scale = a8w8_linear.quantized_weight(QWEN3_8_27B, module, weights)
-        return q, scale
-
-    w_qkv, w_qkv_scale = quantized("in_proj_qkv")
-    w_z, w_z_scale = quantized("in_proj_z")
-    w_out, w_out_scale = quantized("out_proj")
+    w_qkv, w_qkv_scale = quantized_weight(QWEN3_8_27B, in_proj_qkv.MODULE, weights)
+    w_z, w_z_scale = quantized_weight(QWEN3_8_27B, in_proj_z.MODULE, weights)
+    w_out, w_out_scale = quantized_weight(QWEN3_8_27B, out_proj.MODULE, weights)
 
     def stacked_ab():
-        w = block_weights()
-        return torch.cat([w["in_proj_a.weight"], w["in_proj_b.weight"]]).to(torch.bfloat16)
+        return stacked_ab_weight(block_weights())
 
     def taps():
         return block_weights()["conv1d.weight"].reshape(CQKV, KCONV).t().contiguous().float()
@@ -269,7 +267,9 @@ def _reference_out(inputs, weights, *, quant: bool):
 
 def golden_gdn_block(tensors):
     """Fill the fake-quant golden from the block's input tensors."""
-    a8w8_linear.host_torch_setup()
+    from reference import host_torch_setup
+
+    host_torch_setup()
     tensors["out"].copy_(_reference_out(tensors, _reference_weights(tensors), quant=True))
 
 
@@ -295,14 +295,15 @@ def compare_out(weights: str | None):
     import torch
 
     import reference
+    from weights import load_weights
 
     def compare(actual, expected, *, inputs, **_kwargs):
         if actual.shape != expected.shape:
             return False, f"output shape {tuple(actual.shape)} != golden shape {tuple(expected.shape)}"
 
-        a8w8_linear.host_torch_setup()
+        reference.host_torch_setup()
         quantized_weights = _reference_weights(inputs)
-        original_weights = a8w8_linear.load_weights(QWEN3_8_27B, weights)
+        original_weights = load_weights(QWEN3_8_27B, weights)
         truth_weights = quantized_weights.copy()
         for name in GDN_QUANT.weights:
             weight = original_weights.get(name)

@@ -140,6 +140,8 @@ def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, c: int = C, k: int = K, we
     import torch
     from golden import TensorSpec
 
+    from weights import load_layer
+
     def padded_input():
         generator = torch.Generator().manual_seed(42)
         x = torch.randn(t, c, generator=generator).to(torch.bfloat16)
@@ -150,7 +152,7 @@ def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, c: int = C, k: int = K, we
             generator = torch.Generator().manual_seed(47)
             w = ((2 * torch.rand(c, k, generator=generator) - 1) * k ** -0.5).to(torch.bfloat16)
         else:
-            w = torch.load(weights, weights_only=True)["conv1d.weight"].reshape(c, k)
+            w = load_layer(weights)["conv1d.weight"].reshape(c, k)
         return w.t().contiguous().float()
 
     return [

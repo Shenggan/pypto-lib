@@ -160,6 +160,8 @@ def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, hg: int = HG, 
     import torch
     from golden import TensorSpec
 
+    from weights import load_layer
+
     def draw(shape, seed):
         def load():
             generator = torch.Generator().manual_seed(seed)
@@ -173,7 +175,7 @@ def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, hg: int = HG, 
             generator = torch.Generator().manual_seed(48)
             a_log = torch.log(0.01 + (16 - 0.01) * torch.rand(h, generator=generator))
             return {"A_log": a_log, "dt_bias": torch.ones(h)}
-        layer = torch.load(weights, weights_only=True)
+        layer = load_layer(weights)
         return {name: layer[name] for name in ("A_log", "dt_bias")}
 
     return [

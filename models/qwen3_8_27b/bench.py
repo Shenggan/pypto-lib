@@ -98,16 +98,22 @@ def bench_stage(stage: str, t: int, backend_type: str, device: int,
     config = dict(backend_type=backend_type, execution_mode=sim, device_id=device)
     if stage in COMPOSED:
         fn = mod.build_kernel(t=t)
-        specs = mod.build_tensor_specs(t=t)
         config = mod.run_config(backend_type, device, sim, t=t)
+    elif stage == "in_proj_qkv":
+        from a8w8_linear import build_kernel
+
+        fn = build_kernel(
+            t, mod.K, mod.N, name=mod.MODULE,
+            m_tile=mod.M_TILE, n_tile=mod.N_TILE, k_tile=mod.K_TILE,
+            m_group=mod.M_GROUP, n_group=mod.N_GROUP,
+        )
     elif stage in BLOCK_KERNELS:
         fn = mod.build_kernel(t=t)
-        specs = mod.build_tensor_specs(t=t)
     else:
         # The six delta-rule kernels take their shape from the model config and the
         # token count from a dynamic dimension, so the only thing to vary is T.
         fn = getattr(mod, f"gdn_{stage}_test")
-        specs = mod.build_tensor_specs(t=t)
+    specs = mod.build_tensor_specs(t=t)
     if data == "random":
         specs = _random_specs(stage, specs)
 

@@ -133,21 +133,6 @@ def build_kernel(m: int, k: int, n: int, name: str = "a8w8_linear",
 # ---------------------------------------------------------------------------
 
 
-# oneDNN's CPU matmul takes a ~100x slower path when an operand is column-major,
-# which is what `W^T` is here, and this box has 200+ cores that torch oversubscribes.
-# Both are backend switches, not changes to the arithmetic. Same pair as
-# `test_block_reference.py`.
-MAX_THREADS = 32
-
-
-def host_torch_setup():
-    """Make the host references affordable on this aarch64 box. Idempotent."""
-    import torch
-
-    torch.set_num_threads(min(torch.get_num_threads(), MAX_THREADS))
-    torch.backends.mkldnn.enabled = False
-
-
 def golden_y(a_q, a_scale, w_q, w_scale):
     """The kernel's arithmetic in fp32, in its order. -> fp32 [M, N].
 
@@ -156,6 +141,8 @@ def golden_y(a_q, a_scale, w_q, w_scale):
     under the bf16 rounding the output takes, and an int32 matmul of this size
     has no BLAS path on the host.
     """
+    from reference import host_torch_setup
+
     host_torch_setup()
     acc = a_q.float() @ w_q.float().t()
     return acc * w_scale.float()[None, :] * a_scale.float().reshape(-1, 1)
@@ -199,33 +186,6 @@ def compare_y(truth_fn, fakequant_fn, label: str):
 # ---------------------------------------------------------------------------
 
 
-def load_weights(cfg, weights: str | None):
-    """The block's weight set: a layer `weights.py` wrote, or the random one."""
-    import torch
-
-    import reference
-
-    if weights is None:
-        return reference.make_block_weights(cfg)
-    return torch.load(weights, weights_only=True)
-
-
-def quantized_weight(cfg, module: str, weights: str | None):
-    """`module`'s INT8 weight and its per-output-channel fp32 scale, computed once."""
-    import reference
-
-    cache = {}
-
-    def load():
-        if not cache:
-            w = load_weights(cfg, weights)[module + ".weight"]
-            q, scale = reference.quantize_rows(w)
-            cache["q"], cache["scale"] = q, scale.float()
-        return cache
-
-    return (lambda: load()["q"]), (lambda: load()["scale"])
-
-
 _ACT_CACHE: dict[tuple, dict] = {}
 
 
@@ -257,23 +217,25 @@ def references(cfg, module: str, act_fn, weights: str | None):
     truth, `q` and `scale` for the chain the kernel implements.
     """
     import reference
+    from weights import load_weights, quantize_weights
 
     cache = {}
+    name = module + ".weight"
 
     def truth():
         if "truth" not in cache:
-            host_torch_setup()
-            w = load_weights(cfg, weights)[module + ".weight"]
+            reference.host_torch_setup()
+            w = load_weights(cfg, weights)[name]
             cache["truth"] = reference.linear(act_fn()["x"], w)
         return cache["truth"]
 
     def fakequant():
         if "fq" not in cache:
-            host_torch_setup()
-            wq = reference.quantize_weights(load_weights(cfg, weights),
-                                            names=(module + ".weight",))
-            xf = reference.dequantize(act_fn()["q"], act_fn()["scale"].reshape(-1))
-            cache["fq"] = reference.linear(xf, reference.weight(wq, module))
+            reference.host_torch_setup()
+            wq = quantize_weights(load_weights(cfg, weights), names=(name,))
+            act = act_fn()
+            x = reference.dequantize(act["q"], act["scale"].reshape(-1))
+            cache["fq"] = reference.linear(x, reference.weight(wq, module))
         return cache["fq"]
 
     return truth, fakequant

@@ -50,8 +50,10 @@ def build_kernel(t: int = DEFAULT_TEST_SEQ_LEN, k: int = K, n: int = N, inline: 
 
 def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, k: int = K, n: int = N, weights: str | None = None,
                        **_):
+    from weights import quantized_weight
+
     act = a8w8_linear.hidden_activation(QWEN3_8_27B, t, weights)
-    w_q, w_scale = a8w8_linear.quantized_weight(QWEN3_8_27B, MODULE, weights)
+    w_q, w_scale = quantized_weight(QWEN3_8_27B, MODULE, weights)
     return a8w8_linear.build_specs(t, k, n, lambda: act()["q"], lambda: act()["scale"],
                                    w_q, w_scale)
 

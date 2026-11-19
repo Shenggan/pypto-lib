@@ -77,13 +77,6 @@ QUANT_VARIANTS = (
      GDN_QUANT.weights + ("in_proj_a.weight", "in_proj_b.weight"), True, True),
 )
 
-# torch's CPU depthwise conv opens a parallel region per channel group, and the
-# reference's per-(chunk, head) loops one per small matmul; on a 192-core host
-# that overhead is 40 s for a T = 512 conv in float64 against 0.2 s at 16
-# threads, and 3x on the reference. Capped, not fixed: a smaller host keeps its
-# count.
-MAX_THREADS = 32
-
 # Relative Frobenius gate for a float64 (or float32) module. The floor at
 # T = 8192 is 1.3e-7 to 2.7e-7 on `o`, `y` and `out` for both weight sets, set
 # by the module's own fp32 delta rule; the projections are exact. Dropping the
@@ -164,7 +157,7 @@ def quant_table(t: int, x: torch.Tensor, w: dict[str, torch.Tensor],
     print(head + (f" {'out vs bf16':>12}" if bf16_out is not None else ""))
     for name, names, quant_x, quant_y in QUANT_VARIANTS:
         started = time.time()
-        wq = reference.quantize_weights(w, names) if names else w
+        wq = weights_mod.quantize_weights(w, names) if names else w
         st = block_reference.block(x, wq, QWEN3_8_27B, CHUNK, quant_x=quant_x, quant_y=quant_y)
         row = f"  {name:<42} {compare(st['o'], truth['o'])[0]:>15.3e} {compare(st['out'], truth['out'])[0]:>10.3e}"
         if bf16_out is not None:
@@ -248,11 +241,7 @@ def main() -> int:
               "Qwen3_5GatedDeltaNet and has nothing to run without it")
         return 0
 
-    torch.set_num_threads(min(torch.get_num_threads(), MAX_THREADS))
-    # oneDNN's CPU matmul takes a 100x slower path when an operand is column-major,
-    # which is what `solve_triangular` hands the module's chunk loop (1 s per
-    # 25 MFLOP bmm on aarch64). A backend switch, not a change to the maths.
-    torch.backends.mkldnn.enabled = False
+    reference.host_torch_setup()
     if args.weights:
         w = weights_mod.load_layer(args.weights)
         print(f"[weights] real layer from {args.weights}")

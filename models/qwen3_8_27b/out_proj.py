@@ -56,6 +56,7 @@ def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, k: int = K, n: int = N, we
     import torch
 
     from reference import quantize_rows
+    from weights import quantized_weight
 
     @cache
     def activation():
@@ -64,7 +65,7 @@ def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, k: int = K, n: int = N, we
         q, scale = quantize_rows(x)
         return q, scale.reshape(1, t)
 
-    w_q, w_scale = a8w8_linear.quantized_weight(QWEN3_8_27B, MODULE, weights)
+    w_q, w_scale = quantized_weight(QWEN3_8_27B, MODULE, weights)
     return a8w8_linear.build_specs(t, k, n, lambda: activation()[0], lambda: activation()[1], w_q, w_scale)
 
 

@@ -217,6 +217,8 @@ def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, d: int = D,
     import torch
     from golden import TensorSpec
 
+    from weights import load_layer
+
     def output():
         generator = torch.Generator().manual_seed(42)
         return torch.randn(t, h, d, generator=generator).to(torch.float16)
@@ -228,7 +230,7 @@ def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, d: int = D,
     def norm_weight():
         if weights is None:
             return torch.ones(d, dtype=torch.bfloat16)
-        return torch.load(weights, weights_only=True)["norm.weight"]
+        return load_layer(weights)["norm.weight"]
 
     specs = [
         TensorSpec("o", [t, h, d], torch.float16, init_value=output),

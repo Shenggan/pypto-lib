@@ -12,7 +12,7 @@ The operator references and the delta rule compose the block output.
 
 :func:`block` is two references in one. On bf16 weights with no activation
 quantisation it is the float64 truth: how far a result is from the model. On
-int8 weights (`reference.quantize_weights`) with `quant_x` / `quant_y` it is the
+int8 weights (`weights.quantize_weights`) with `quant_x` / `quant_y` it is the
 W8A8 chain the projection kernels implement, with their exact quantisation
 arithmetic -- the correctness gate for those kernels, since quantisation alone
 puts the block ~3e-2 from the truth, ten times the model's own bf16 rounding.
@@ -41,7 +41,7 @@ def block(x: torch.Tensor, w: dict[str, torch.Tensor], cfg: Qwen38Config,
     and `out`. Nothing is narrowed anywhere.
 
     What you pass is what you get. bf16 weights compute the truth; int8 ones
-    (`reference.quantize_weights`) are used at their dequantised values. *quant_x*
+    (`weights.quantize_weights`) are used at their dequantised values. *quant_x*
     quantises the hidden states per token before every projection reads them,
     *quant_y* the normed output per token before `out_proj` -- the two
     activation quantisations a W8A8 block performs, at the places the kernels

@@ -38,18 +38,12 @@ N_GROUP = 2
 OUTPUTS = ("y",)                    # bench.py reads it
 
 
-def build_kernel(t: int = DEFAULT_TEST_SEQ_LEN, k: int = K, n: int = N, inline: bool = False,
-                 m_tile: int = M_TILE, n_tile: int = N_TILE, k_tile: int = K_TILE,
-                 m_group: int = M_GROUP, n_group: int = N_GROUP, row_off: int = 0):
-    return a8w8_linear.build_kernel(t, k, n, name=MODULE, inline=inline, m_tile=m_tile,
-                                    n_tile=n_tile, k_tile=k_tile, m_group=m_group,
-                                    n_group=n_group, row_off=row_off)
-
-
 def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, k: int = K, n: int = N, weights: str | None = None,
                        **_):
+    from weights import quantized_weight
+
     act = a8w8_linear.hidden_activation(QWEN3_8_27B, t, weights)
-    w_q, w_scale = a8w8_linear.quantized_weight(QWEN3_8_27B, MODULE, weights)
+    w_q, w_scale = quantized_weight(QWEN3_8_27B, MODULE, weights)
     return a8w8_linear.build_specs(t, k, n, lambda: act()["q"], lambda: act()["scale"],
                                    w_q, w_scale)
 
@@ -73,9 +67,13 @@ def validate() -> None:
         os.environ["PYPTO_BENCH_ROUNDS"] = str(args.rounds)
         os.environ["PYPTO_BENCH_WARMUP"] = "5"
 
+    fn = a8w8_linear.build_kernel(
+        args.seq_len, K, N, name=MODULE,
+        m_tile=args.m_tile, n_tile=args.n_tile, k_tile=args.k_tile,
+        m_group=args.m_group, n_group=args.n_group,
+    )
     result = run(
-        fn=build_kernel(t=args.seq_len, m_tile=args.m_tile, n_tile=args.n_tile,
-                        k_tile=args.k_tile, m_group=args.m_group, n_group=args.n_group),
+        fn=fn,
         specs=build_tensor_specs(t=args.seq_len, weights=args.weights),
         golden_fn=a8w8_linear.golden_fn,
         golden_data=args.golden_data,
