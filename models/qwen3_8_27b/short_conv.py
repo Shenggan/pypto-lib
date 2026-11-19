@@ -118,69 +118,46 @@ def golden_gdn_short_conv(tensors):
     tensors["y"].copy_(y.to(torch.bfloat16))
 
 
-def _pad_input(t: int, c: int, k: int, chunk: int, weights: str | None):
-    """The projection output with k-1 zero rows in front, bf16. -> [T + k - 1, C]."""
+def short_conv_ref(x, weight):
+    """Float64 causal convolution and SiLU on unpadded tokens and checkpoint taps."""
     import torch
+    from torch.nn.functional import silu
 
-    import block_reference
+    from reference import REF_DTYPE
 
-    src = block_reference.block_inputs("qkv", t, QWEN3_8_27B, chunk, weights=weights)
-
-    def load():
-        x = src().to(torch.bfloat16)
-        return torch.cat([torch.zeros(k - 1, c, dtype=torch.bfloat16), x])
-
-    return load
-
-
-def _taps(c: int, k: int, weights: str | None):
-    """`conv1d.weight` as [K, C] fp32: a row per tap, which is what the tile loop reads."""
-    import torch
-
-    import reference
-
-    def load():
-        if weights is None:
-            w = reference.make_block_weights(QWEN3_8_27B)["conv1d.weight"]
-        else:
-            w = torch.load(weights, weights_only=True)["conv1d.weight"]
-        return w.reshape(c, k).t().contiguous().float()
-
-    return load
+    t, c = x.shape
+    k = weight.shape[-1]
+    xf = x.to(REF_DTYPE)
+    wf = weight.reshape(c, k).to(REF_DTYPE)
+    padded = torch.cat([torch.zeros(k - 1, c, dtype=REF_DTYPE), xf])
+    out = torch.zeros(t, c, dtype=REF_DTYPE)
+    for j in range(k):
+        out += padded[j : j + t] * wf[:, j]
+    return silu(out)
 
 
-def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, c: int = C, k: int = K, chunk: int = 128,
-                       weights: str | None = None):
+def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, c: int = C, k: int = K, weights: str | None = None):
     import torch
     from golden import TensorSpec
 
+    def padded_input():
+        generator = torch.Generator().manual_seed(42)
+        x = torch.randn(t, c, generator=generator).to(torch.bfloat16)
+        return torch.cat([torch.zeros(k - 1, c, dtype=x.dtype), x])
+
+    def taps():
+        if weights is None:
+            generator = torch.Generator().manual_seed(47)
+            w = ((2 * torch.rand(c, k, generator=generator) - 1) * k ** -0.5).to(torch.bfloat16)
+        else:
+            w = torch.load(weights, weights_only=True)["conv1d.weight"].reshape(c, k)
+        return w.t().contiguous().float()
+
     return [
-        TensorSpec("x_pad", [t + k - 1, c], torch.bfloat16, init_value=_pad_input(t, c, k, chunk, weights)),
-        TensorSpec("w", [k, c], torch.float32, init_value=_taps(c, k, weights)),
+        TensorSpec("x_pad", [t + k - 1, c], torch.bfloat16, init_value=padded_input),
+        TensorSpec("w", [k, c], torch.float32, init_value=taps),
         TensorSpec("y", [t, c], torch.bfloat16),
     ]
-
-
-def compare_y(t: int, chunk: int, weights: str | None):
-    """The bf16 gate, plus the distance from the float64 reference the roadmap set."""
-    from golden import ratio_allclose
-
-    import block_reference
-
-    gate = ratio_allclose(atol=3e-3, rtol=3e-3, max_error_ratio=0.02)
-
-    def compare(actual, expected, **kw):
-        ok, detail = gate(actual, expected, **kw)
-        ref = block_reference.block_inputs("qkv_conv", t, QWEN3_8_27B, chunk, weights=weights)()
-        dev = actual.double()
-        max_abs = float((dev - ref).abs().max())
-        frob = float((dev - ref).norm() / ref.norm())
-        print(f"[stats] y vs float64 reference: max abs {max_abs:.3e} (bf16 tol 6e-2), "
-              f"rel frob {frob:.3e}; vs golden max abs {float((dev - expected.double()).abs().max()):.3e}",
-              flush=True)
-        return ok, detail
-
-    return compare
 
 
 if __name__ == "__main__":
@@ -188,7 +165,7 @@ if __name__ == "__main__":
     import os
     import statistics
 
-    from golden import run
+    from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
@@ -223,7 +200,7 @@ if __name__ == "__main__":
         config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
         rtol=1e-3,
         atol=1e-5,
-        compare_fn={"y": compare_y(args.seq_len, 128, args.weights)},
+        compare_fn={"y": ratio_allclose(atol=3e-3, rtol=3e-3, max_error_ratio=0.02)},
         compile_only=args.compile_only,
     )
     if args.rounds and result.bench is not None:

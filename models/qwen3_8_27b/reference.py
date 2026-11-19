@@ -16,14 +16,9 @@ states); the kernels take some of those transposed or flattened, and :func:`to_h
 
 Grouped-query attention is implemented: `hg` QK heads against `h` value heads, value head
 `i` reading key head `i // (h // hg)`. `hg` defaults to `h`, which makes the mapping an
-identity. Single sequence (B = 1); packed variable-length batches are a pipeline feature
+identity. The fixtures use a single sequence (B = 1).
 
-Around the stage helpers sits the block: the projections, the short convolution, the
-qk-norm and gate, the gated RMSNorm and `out_proj`, each a float64 function here. The
-chain that strings them together lives in `block_reference.py`, which composes them
-with the delta rule; `test_block_reference.py` checks it against the model's own
-`Qwen3_5GatedDeltaNet`.
-the kernels do not implement yet.
+Block fixture generation, quantization, and projection math are shared here.
 """
 from __future__ import annotations
 
@@ -108,9 +103,6 @@ WEIGHT_NAMES = ("in_proj_qkv.weight", "in_proj_z.weight", "in_proj_a.weight",
 
 # The model's dtype: what the checkpoint stores and what its activations carry.
 MODEL_DTYPE = torch.bfloat16
-
-QK_NORM_EPS = 1e-6
-
 
 def make_block_inputs(t: int, cfg: Qwen38Config, seed: int = 42) -> torch.Tensor:
     """Hidden states entering the block, `[T, hidden]`, unit normal in bf16.
@@ -204,59 +196,6 @@ def weight(w: dict[str, torch.Tensor], module: str) -> torch.Tensor:
 def linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """`nn.Linear` without bias: `x @ W^T`, W stored `[out, in]`."""
     return x.to(REF_DTYPE) @ weight.to(REF_DTYPE).t()
-
-
-def short_conv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Depthwise causal convolution over the token axis, then silu. [T, C] -> [T, C].
-
-    `out[t, c] = sum_j w[c, j] * x[t - (K - 1) + j, c]`, taps before the start of
-    the sequence reading zero -- `nn.Conv1d(padding=K-1, groups=C, bias=False)`
-    kept to its first T outputs. So tap `K-1` reads the token itself and tap `0`
-    the token `K-1` back: the filter is written newest-last.
-    """
-    t, c = x.shape
-    k = weight.shape[-1]
-    xf = x.to(REF_DTYPE)
-    wf = weight.reshape(c, k).to(REF_DTYPE)
-    padded = torch.cat([torch.zeros(k - 1, c, dtype=REF_DTYPE), xf])
-    out = torch.zeros(t, c, dtype=REF_DTYPE)
-    for j in range(k):
-        out += padded[j : j + t] * wf[:, j]
-    return F.silu(out)
-
-
-def l2norm(x: torch.Tensor, eps: float = QK_NORM_EPS) -> torch.Tensor:
-    """`x * rsqrt(sum(x^2) + eps)` over the last dim: the eps sits inside the sqrt."""
-    xf = x.to(REF_DTYPE)
-    return xf * torch.rsqrt((xf * xf).sum(dim=-1, keepdim=True) + eps)
-
-
-def qk_norm_gate(q: torch.Tensor, k: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
-                 a_log: torch.Tensor, dt_bias: torch.Tensor
-                 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """What the delta rule reads: q and k L2-normalised, q scaled by D^-0.5, beta, g.
-
-    `beta = sigmoid(b)`; `g = -exp(A_log) * softplus(a + dt_bias)`, so g <= 0 and
-    the state only ever decays. Both are per value head, `[T, H]`.
-    """
-    d = q.shape[-1]
-    q_out = l2norm(q) * d ** -0.5
-    k_out = l2norm(k)
-    beta = torch.sigmoid(b.to(REF_DTYPE))
-    g = -torch.exp(a_log.to(REF_DTYPE)) * F.softplus(a.to(REF_DTYPE) + dt_bias.to(REF_DTYPE))
-    return q_out, k_out, beta, g
-
-
-def gated_rmsnorm(o: torch.Tensor, z: torch.Tensor, weight: torch.Tensor,
-                  eps: float) -> torch.Tensor:
-    """RMSNorm over the head dim, times the weight, times `silu(z)`. [T, H, D] -> same.
-
-    The gate multiplies after the norm (`Qwen3_5RMSNormGated`: "norm before
-    gate"), so z does not enter the variance.
-    """
-    of = o.to(REF_DTYPE)
-    var = (of * of).mean(dim=-1, keepdim=True)
-    return of * torch.rsqrt(var + eps) * weight.to(REF_DTYPE) * F.silu(z.to(REF_DTYPE))
 
 
 # Acceptance criterion

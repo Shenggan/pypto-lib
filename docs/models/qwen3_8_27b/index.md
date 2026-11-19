@@ -307,16 +307,14 @@ Each of the six delta-rule files is its own test. It owns the float64 torch
 reference for its own stage, builds its inputs by calling the references of the
 stages before it, computes a golden, and scores the device result with the
 harness's `ratio_reldiff` per point plus a relative Frobenius norm over the whole
-output. [reference.py](../../../models/qwen3_8_27b/reference.py) holds what they
-share -- the drawn inputs, the two layout conversions and the acceptance
-criterion -- and, for the block, the float64 form of each piece around the delta
-rule: the four projections, the depthwise convolution, the qk-norm and gate, the
-gated RMSNorm and `out_proj`, read line by line from `Qwen3_5GatedDeltaNet` in
-`transformers`.
-[block_reference.py](../../../models/qwen3_8_27b/block_reference.py) strings
-those and `gdn_layer.delta_rule_ref` into one chain, hidden states to hidden
-states. That block chain is what every block operator and the composed block are
-scored against, so it is itself checked against the model's own module:
+output. [reference.py](../../../models/qwen3_8_27b/reference.py) holds the shared
+fixtures, layout conversions, comparators, quantization and projection math.
+`short_conv`, `qk_norm_gate`, `gated_rmsnorm`, and `out_proj` construct their
+direct inputs locally for standalone correctness checks.
+[block_reference.py](../../../models/qwen3_8_27b/block_reference.py) composes
+the float64 convolution, Q/K normalization and gate, gated RMSNorm,
+`gdn_layer.delta_rule_ref`, and the projection math into the golden for the
+complete block. The block golden is checked against the model's own module.
 [test_block_reference.py](../../../models/qwen3_8_27b/test_block_reference.py)
 runs `Qwen3_5GatedDeltaNet` on the same hidden states and weights and compares
 the two at every projection, after the delta rule, after the norm and at the
@@ -335,12 +333,11 @@ arithmetic. `test_block_reference.py --quant` reports what each part of that
 scheme costs against the truth: on the real layer at T = 8192 the whole scheme
 sits 3.0e-2 away, of which int8 weights alone are 1.1e-2, the per-token hidden
 states 1.3e-2 and the per-token normed output 2.4e-2 — ten times the model's own
-bf16 rounding. That is why the projection kernels are gated against this chain
-and only reported against the truth: quantisation is the whole gap by
-construction, and a kernel gate has to sit below it.
+bf16 rounding. The standalone projection goldens use W8A8 arithmetic on the
+inputs of each projection.
 
-Two weight sets serve that check and every later one: random weights drawn the
-way the module's own `__init__` draws them, and one real layer.
+The complete block can be checked with the module's random initialization
+or a real checkpoint layer supplied to `gdn_block.py --weights`.
 [weights.py](../../../models/qwen3_8_27b/weights.py) fetches a layer's nine
 `linear_attn` tensors from the published checkpoint with a single 221 MiB range
 request -- they are contiguous in their shard -- so no checkpoint download is
