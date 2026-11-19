@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """The block reference against the model's own module, `Qwen3_5GatedDeltaNet`.
 
-`block_reference.block` is what every kernel of the block is scored against, so it has
+`reference.block` is what every kernel of the block is scored against, so it has
 to be right before anything is built on it. This runs the `transformers` module
 on the same hidden states and weights and compares the two chains at every point
 a forward hook can reach: the four projections, the delta rule's output, the
@@ -58,13 +58,11 @@ import time
 
 import torch
 
-import block_reference
 import reference
 import weights as weights_mod
 from chunk_cumsum import CHUNK_TILE
 from config import GDN_QUANT, QWEN3_8_27B
 
-CHUNK = CHUNK_TILE
 
 # The W8A8 ablation: what is int8 in each variant. `weights` names the weight
 # set to quantise, or None for bf16.
@@ -72,10 +70,19 @@ QUANT_VARIANTS = (
     ("int8 weights only, activations exact", GDN_QUANT.weights, False, False),
     ("per-token int8 x only, weights exact", None, True, False),
     ("per-token int8 y only, weights exact", None, False, True),
-    ("W8A8 -- the scheme", GDN_QUANT.weights, True, True),
+    ("W8A8 -- the scheme", GDN_QUANT.weights, True, False),
+    ("W8A8 with out_proj int8 too, which the checkpoint does not do",
+     GDN_QUANT.weights + ("out_proj.weight",), True, True),
     ("W8A8 with in_proj_a/b int8 too",
-     GDN_QUANT.weights + ("in_proj_a.weight", "in_proj_b.weight"), True, True),
+     GDN_QUANT.weights + ("in_proj_a.weight", "in_proj_b.weight"), True, False),
 )
+
+# torch's CPU depthwise conv opens a parallel region per channel group, and the
+# reference's per-(chunk, head) loops one per small matmul; on a 192-core host
+# that overhead is 40 s for a T = 512 conv in float64 against 0.2 s at 16
+# threads, and 3x on the reference. Capped, not fixed: a smaller host keeps its
+# count.
+MAX_THREADS = 32
 
 # Relative Frobenius gate for a float64 (or float32) module. The floor at
 # T = 8192 is 1.3e-7 to 2.7e-7 on `o`, `y` and `out` for both weight sets, set
@@ -157,8 +164,8 @@ def quant_table(t: int, x: torch.Tensor, w: dict[str, torch.Tensor],
     print(head + (f" {'out vs bf16':>12}" if bf16_out is not None else ""))
     for name, names, quant_x, quant_y in QUANT_VARIANTS:
         started = time.time()
-        wq = weights_mod.quantize_weights(w, names) if names else w
-        st = block_reference.block(x, wq, QWEN3_8_27B, CHUNK, quant_x=quant_x, quant_y=quant_y)
+        wq = reference.quantize_weights(w, names) if names else w
+        st = reference.block(x, wq, QWEN3_8_27B, CHUNK_TILE, quant_x=quant_x, quant_y=quant_y)
         row = f"  {name:<42} {compare(st['o'], truth['o'])[0]:>15.3e} {compare(st['out'], truth['out'])[0]:>10.3e}"
         if bf16_out is not None:
             row += f" {compare(st['out'], bf16_out)[0]:>12.3e}"
@@ -181,7 +188,7 @@ def check(t: int, w: dict[str, torch.Tensor], dtypes: list[torch.dtype],
 
     x = reference.make_block_inputs(t, QWEN3_8_27B, seed)
     started = time.time()
-    ours = block_reference.block(x, w, QWEN3_8_27B, CHUNK)
+    ours = reference.block(x, w, QWEN3_8_27B, CHUNK_TILE)
     print(f"[ref] float64 block at T={t}: {time.time() - started:.1f}s; "
           f"g in [{float(ours['g'].min()):.3g}, {float(ours['g'].max()):.3g}], "
           f"chunk g_sum min {float(ours['g_sum'].min()):.3g}, "
@@ -215,6 +222,14 @@ def check(t: int, w: dict[str, torch.Tensor], dtypes: list[torch.dtype],
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    # Accepted and ignored: this check is host-only, but CI invokes every runnable
+    # file in a model directory as `python <file> -p <platform> -d <card>`.
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3",
+                        help="accepted for CI's uniform invocation; nothing here runs on device")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true",
+                        help="accepted for CI's uniform invocation; unused")
+    parser.add_argument("-d", "--device", type=int, default=0,
+                        help="accepted for CI's uniform invocation; unused")
     parser.add_argument("--seq-len", type=int, default=1024,
                         help="the comparison is per-element, so a short sequence checks the "
                              "same thing; 8192 is the shape the numbers in the docs quote")
@@ -241,7 +256,11 @@ def main() -> int:
               "Qwen3_5GatedDeltaNet and has nothing to run without it")
         return 0
 
-    reference.host_torch_setup()
+    torch.set_num_threads(min(torch.get_num_threads(), MAX_THREADS))
+    # oneDNN's CPU matmul takes a 100x slower path when an operand is column-major,
+    # which is what `solve_triangular` hands the module's chunk loop (1 s per
+    # 25 MFLOP bmm on aarch64). A backend switch, not a change to the maths.
+    torch.backends.mkldnn.enabled = False
     if args.weights:
         w = weights_mod.load_layer(args.weights)
         print(f"[weights] real layer from {args.weights}")
@@ -253,7 +272,7 @@ def main() -> int:
     passed = check(args.seq_len, w, dtypes, args.seed, args.tol, quant=args.quant)
     print(f"\n{'PASS' if passed else 'FAIL'}: T={args.seq_len} "
           f"H={QWEN3_8_27B.linear_num_value_heads} Hg={QWEN3_8_27B.linear_num_key_heads} "
-          f"D={QWEN3_8_27B.linear_value_head_dim} chunk={CHUNK}")
+          f"D={QWEN3_8_27B.linear_value_head_dim} chunk={CHUNK_TILE}")
     return 0 if passed else 1
 
 
