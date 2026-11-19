@@ -29,8 +29,8 @@ CHUNK = CHUNK_TILE                          # only picks the reference chain to 
 
 MODULE = "out_proj"
 
-# case shape
-T = 8192                # tokens (single sequence, B = 1)
+# validation
+DEFAULT_TEST_SEQ_LEN = 512
 
 # tiling
 M_TILE = 128
@@ -42,9 +42,11 @@ N_GROUP = 2
 OUTPUTS = ("y",)                    # bench.py reads it
 
 
-def build_kernel(t: int = T, k: int = K, n: int = N, inline: bool = False,
+def build_kernel(t: int = DEFAULT_TEST_SEQ_LEN, k: int = K, n: int = N, inline: bool = False,
                  m_tile: int = M_TILE, n_tile: int = N_TILE, k_tile: int = K_TILE,
-                 m_group: int = M_GROUP, n_group: int = N_GROUP):
+                 m_group: int | None = None, n_group: int = N_GROUP):
+    if m_group is None:
+        m_group = a8w8_linear.default_m_group(t, m_tile, M_GROUP)
     return a8w8_linear.build_kernel(t, k, n, name=MODULE, inline=inline, m_tile=m_tile,
                                     n_tile=n_tile, k_tile=k_tile, m_group=m_group,
                                     n_group=n_group)
@@ -77,7 +79,7 @@ def _activation(t: int, chunk: int, weights: str | None):
     return load
 
 
-def build_tensor_specs(t: int = T, k: int = K, n: int = N, chunk: int = CHUNK,
+def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, k: int = K, n: int = N, chunk: int = CHUNK,
                        weights: str | None = None, **_):
     act = _activation(t, chunk, weights)
     w_q, w_scale = a8w8_linear.quantized_weight(QWEN3_8_27B, MODULE, weights)
@@ -91,15 +93,14 @@ def compare_y(t: int, chunk: int, weights: str | None):
     return a8w8_linear.compare_y(truth, fakequant, "out")
 
 
-if __name__ == "__main__":
+def validate() -> None:
     import argparse
     import os
 
     from golden import run
 
-    args = a8w8_linear.add_args(
-        argparse.ArgumentParser(description=__doc__.splitlines()[0]),
-        M_TILE, N_TILE, K_TILE, T, M_GROUP, N_GROUP).parse_args()
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    args = a8w8_linear.parse_args(parser, M_TILE, N_TILE, K_TILE, DEFAULT_TEST_SEQ_LEN, M_GROUP, N_GROUP)
     if args.rounds:
         os.environ["PYPTO_BENCH"] = "1"
         os.environ["PYPTO_BENCH_ROUNDS"] = str(args.rounds)
@@ -113,7 +114,7 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
-        config=dict(platform=args.platform, device_id=args.device),
+        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
         rtol=1e-3,
         atol=1e-5,
         compare_fn={"y": compare_y(args.seq_len, CHUNK, args.weights)},
@@ -124,3 +125,7 @@ if __name__ == "__main__":
         if result.error:
             print(result.error)
         raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    validate()

@@ -33,8 +33,8 @@ CHUNK = CHUNK_TILE                          # only picks the reference chain to 
 SCALE_MAX = GDN_QUANT.scale_max
 AMAX_EPS = GDN_QUANT.amax_eps
 
-# case shape
-T = 8192                # tokens (single sequence, B = 1)
+# validation
+DEFAULT_TEST_SEQ_LEN = 512
 
 # gate
 MIN_EXACT_VS_REFERENCE = 0.95   # of y_q elements identical to the fake-quant reference
@@ -47,7 +47,7 @@ TOK_TILE = 16           # tokens per block; 16 scalar scale writes fill one 64-b
 OUTPUTS = ("y_q", "y_scale")        # int8 variant; bench.py reads it
 
 
-def build_kernel(t: int = T, h: int = H, d: int = D, eps: float = EPS,
+def build_kernel(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, d: int = D, eps: float = EPS,
                  inline: bool = False, quant: bool = True):
     """The operator at one shape. `inline` makes it a callee for `gdn_block`.
 
@@ -221,7 +221,7 @@ def _norm_weight(weights: str | None):
     return torch.load(weights, weights_only=True)["norm.weight"]
 
 
-def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK,
+def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, d: int = D, chunk: int = CHUNK,
                        weights: str | None = None, quant: bool = True):
     import torch
     from golden import TensorSpec
@@ -335,10 +335,10 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=DEFAULT_TEST_SEQ_LEN)
     parser.add_argument("--heads", type=int, default=H, help="value heads H")
     parser.add_argument("--weights", type=str, default=None,
                         help="a real layer from weights.py; default: random weights")
@@ -365,7 +365,7 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
-        config=dict(platform=args.platform, device_id=args.device),
+        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
         rtol=1e-3,
         atol=1e-5,
         compare_fn=({"y_q": compare_y_q(args.seq_len, CHUNK, args.weights)} if quant

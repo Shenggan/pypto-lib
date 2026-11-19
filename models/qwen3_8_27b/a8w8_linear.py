@@ -25,6 +25,8 @@ The three instances live in `in_proj_qkv.py`, `in_proj_z.py` and `out_proj.py`,
 which supply the shape, the tiles, and where the weight and the reference come
 from.
 """
+from math import gcd
+
 import pypto.language as pl
 
 # tiling defaults; each instance overrides them
@@ -291,11 +293,15 @@ def build_specs(m: int, k: int, n: int, a_q_fn, a_scale_fn, w_q_fn, w_scale_fn):
     ]
 
 
-def add_args(parser, m_tile: int, n_tile: int, k_tile: int, t: int,
-             m_group: int = M_GROUP, n_group: int = N_GROUP):
+def default_m_group(m: int, m_tile: int, preferred: int) -> int:
+    return gcd(m // m_tile, preferred)
+
+
+def parse_args(parser, m_tile: int, n_tile: int, k_tile: int, t: int,
+               m_group: int = M_GROUP, n_group: int = N_GROUP):
     """The CLI every instance shares."""
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seq-len", type=int, default=t)
     parser.add_argument("--weights", type=str, default=None,
@@ -303,7 +309,7 @@ def add_args(parser, m_tile: int, n_tile: int, k_tile: int, t: int,
     parser.add_argument("--m-tile", type=int, default=m_tile)
     parser.add_argument("--n-tile", type=int, default=n_tile)
     parser.add_argument("--k-tile", type=int, default=k_tile)
-    parser.add_argument("--m-group", type=int, default=m_group)
+    parser.add_argument("--m-group", type=int, help="override the default group for the token count")
     parser.add_argument("--n-group", type=int, default=n_group)
     parser.add_argument("--rounds", type=int, default=0,
                         help="also time the kernel over this many rounds (device only)")
@@ -311,7 +317,10 @@ def add_args(parser, m_tile: int, n_tile: int, k_tile: int, t: int,
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--compile-only", action="store_true", default=False)
-    return parser
+    args = parser.parse_args()
+    if args.m_group is None:
+        args.m_group = default_m_group(args.seq_len, args.m_tile, m_group)
+    return args
 
 
 def report(label: str, args, result, k: int, n: int):

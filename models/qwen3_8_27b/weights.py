@@ -108,13 +108,6 @@ def load_layer(path: str | Path) -> dict[str, torch.Tensor]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    # Accepted and ignored: this is a host-side tool, but CI invokes every runnable
-    # file in a model directory as `python <file> -p <platform> -d <card>`.
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"],
-                        help="accepted for CI's uniform invocation; nothing here runs on device")
-    parser.add_argument("-d", "--device", type=int, default=0,
-                        help="accepted for CI's uniform invocation; unused")
     parser.add_argument("--fetch", action="store_true",
                         help="download the layer from the checkpoint if it is not already "
                              "on disk; without it a missing file is reported, not fetched")

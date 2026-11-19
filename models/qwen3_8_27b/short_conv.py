@@ -24,8 +24,8 @@ from config import QWEN3_8_27B
 C = QWEN3_8_27B.qkv_width                   # q and k at Hg heads, v at H
 K = QWEN3_8_27B.linear_conv_kernel_dim      # taps, newest last
 
-# case shape
-T = 8192                # tokens (single sequence, B = 1)
+# validation
+DEFAULT_TEST_SEQ_LEN = 512
 
 # tiling
 TOK_TILE = 16           # output rows per pipelined step
@@ -33,7 +33,7 @@ CH_TILE = 256           # channels per block
 GROUP = 16              # row-tiles per block, the pipelined inner loop
 
 
-def build_kernel(t: int = T, c: int = C, k: int = K, inline: bool = False,
+def build_kernel(t: int = DEFAULT_TEST_SEQ_LEN, c: int = C, k: int = K, inline: bool = False,
                  tok_tile: int = TOK_TILE, ch_tile: int = CH_TILE, group: int = GROUP,
                  c_off: int = 0, c_out: int | None = None, out_heads: int | None = None,
                  out_dtype=pl.BF16, name: str = "short_conv"):
@@ -149,7 +149,7 @@ def _taps(c: int, k: int, weights: str | None):
     return load
 
 
-def build_tensor_specs(t: int = T, c: int = C, k: int = K, chunk: int = 128,
+def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, c: int = C, k: int = K, chunk: int = 128,
                        weights: str | None = None):
     import torch
     from golden import TensorSpec
@@ -191,10 +191,10 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=DEFAULT_TEST_SEQ_LEN)
     parser.add_argument("--weights", type=str, default=None,
                         help="a real layer from weights.py; default: random weights")
     parser.add_argument("--tok-tile", type=int, default=TOK_TILE)
@@ -220,7 +220,7 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
-        config=dict(platform=args.platform, device_id=args.device),
+        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
         rtol=1e-3,
         atol=1e-5,
         compare_fn={"y": compare_y(args.seq_len, 128, args.weights)},

@@ -347,30 +347,31 @@ needed. A trained layer's `A_log` and `dt_bias` reach a decay range the random
 init does not, and that is the range where a wrong scale, a wrong eps or a
 saturating gate would show.
 
-A default invocation of a delta-rule entry runs its `DEFAULT_CASES`: one chunk,
-the cross-chunk recurrence and eight chunks (128, 256, 1024 tokens) for the five
-that accept a single chunk; `chunk_cumsum` and `gdn_layer` dispatch
-`CHUNK_TILE * GROUP_TILE = 512` tokens at a time, so they run 512 and 1024
-instead. `--seq-len` runs one shape instead, and `BENCH_SEQ = 8192` is the
-prefill shape a performance run names. `PYPTO_BENCH=1` turns any of them into a
-benchmark, and the harness prints the median `effective_us`.
+The Gated DeltaNet block and its eight surrounding operators default to 512
+tokens for correctness checks on hardware and the simulator. Four 128-token
+chunks exercise the block's cross-chunk recurrence and fill one dispatch group
+in `chunk_cumsum`. The block uses the runtime's default ring heaps at this shape.
+
+The delta-rule entries use their `DEFAULT_CASES`. `chunk_cumsum` and `gdn_layer`
+run 512 and 1024 tokens, covering one and two dispatch groups. The other five
+delta-rule operators run 128, 256, and 1024 tokens. Use `--seq-len 8192` for
+the prefill benchmark shape.
+`PYPTO_BENCH=1` enables timing and the harness prints the median `effective_us`.
 
 ```bash
 python models/qwen3_8_27b/gdn_block.py -p a2a3 -d 0
-python models/qwen3_8_27b/gdn_block.py -p a2a3sim --seq-len 2048
+python models/qwen3_8_27b/gdn_block.py -p a2a3 --sim
 python models/qwen3_8_27b/gdn_layer.py -p a2a3 -d 0
 python models/qwen3_8_27b/chunk_h.py -p a2a3 --sim
 PYPTO_BENCH=1 python models/qwen3_8_27b/gdn_layer.py -p a2a3 -d 0 --seq-len 8192
 python models/qwen3_8_27b/bench.py -p a2a3 -d 0 --seq-len 8192
 ```
 
-The block is marked device-only for CI: on a simulator it takes about eight
-minutes at T = 8192, more than the shared simulator job can spend on one file,
-so CI exercises it on hardware and the operators individually on the simulator.
-By hand it runs on either, and `--seq-len 2048` is the short shape used for
-simulator checks.
-
-The block reference check needs no NPU, only `transformers` (5.17.0), and skips with a message if it is absent. Its default sequence length is 1024, which checks the same thing element for element; the numbers quoted above are at 8192. `weights.py` needs `--fetch` the first time, since it pulls from the checkpoint:
+Run `bench.py`, `test_block_reference.py`, and `weights.py` manually. The
+block reference check runs on CPU with `transformers` (5.17.0) and skips with
+a message if it is absent. It checks 1024 tokens by default. The results quoted
+above use 8192 tokens. Use `weights.py --fetch` to download the checkpoint
+tensors on the first run.
 
 ```bash
 python models/qwen3_8_27b/weights.py --layer 0 --fetch
@@ -380,7 +381,3 @@ python models/qwen3_8_27b/test_block_reference.py --seq-len 8192 --weights build
 python models/qwen3_8_27b/test_block_reference.py --seq-len 8192 --weights build_output/qwen3_8_27b/linear_attn_layer0.pt --quant
 python models/qwen3_8_27b/test_block_reference.py --module-dtype float64,bfloat16
 ```
-
-These are entry points, not pytest cases: the device ones need an NPU and a
-compile, the block check a `transformers` install and a weight download, so they
-carry no `test_` functions and CI never collects them.

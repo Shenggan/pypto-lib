@@ -6,7 +6,6 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: no-sim
 """Qwen3.8-27B's whole Gated DeltaNet block: hidden states in, hidden states out.
 
     x_q, x_scale = quant_x(x)                     per-token int8 of the hidden states
@@ -49,7 +48,7 @@ import qk_norm_gate
 import quant_x
 import short_conv
 import solve_tril
-from chunk_cumsum import CHUNK_TILE
+from chunk_cumsum import CHUNK_TILE, DISPATCH_TOKENS
 from config import QWEN3_8_27B
 
 # model shape
@@ -62,15 +61,10 @@ D = QWEN3_8_27B.linear_value_head_dim
 KCONV = QWEN3_8_27B.linear_conv_kernel_dim  # convolution taps
 CHUNK = CHUNK_TILE
 
-# case shape
-T = 8192                # tokens (single sequence, B = 1)
+# validation
+DEFAULT_TEST_SEQ_LEN = 512
 
-# At T = 8192 the block holds about 1.3 GB of intermediates at once: 0.6 GB
-# inside the delta rule, and the projections, the convolution's three outputs
-# and the quantised hand-offs on top. `gdn_layer` needs 1 GiB for its 0.6 GB,
-# so this follows the same ratio, rounded up: the runtime takes powers of two
-# only. Under the default 256 MiB per ring the layer alone fails with
-# orch_error_code=2 HEAP_RING_DEADLOCK.
+# Per-ring heap override for sequences longer than one dispatch group.
 BLOCK_RING_HEAP = 4 * 1024 * 1024 * 1024
 
 # tiling
@@ -79,14 +73,20 @@ HALO_TILE = 1024        # channels per block of the zero fill above the projecti
 OUTPUTS = ("out",)      # bench.py reads it
 
 
-def run_config(platform: str = "a2a3", device: int = 0) -> dict:
-    """The config `golden.run` needs for this block. The ring heap is not optional."""
-    return dict(platform=platform, device_id=device, ring_heap=BLOCK_RING_HEAP)
+def run_config(backend_type: str = "a2a3", device: int = 0, sim: bool = False, *, t: int = DEFAULT_TEST_SEQ_LEN) -> dict:
+    """Configure the block's backend and ring heap for the token count."""
+    config = dict(backend_type=backend_type, execution_mode=sim, device_id=device)
+    if t > DISPATCH_TOKENS:
+        config["ring_heap"] = BLOCK_RING_HEAP
+    return config
 
 
-def build_kernel(t: int = T, h: int = H, hg: int = HG, d: int = D, chunk: int = CHUNK,
+def build_kernel(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, hg: int = HG, d: int = D, chunk: int = CHUNK,
                  inline: bool = False):
     """The block at one shape, composing fourteen operators as inlined callees."""
+    if t <= 0 or t % DISPATCH_TOKENS:
+        raise ValueError(f"t={t} must be a positive multiple of {DISPATCH_TOKENS}")
+
     c, cqkv, cv, k = C, CQKV, CV, KCONV
     key_width = hg * d
 
@@ -176,7 +176,7 @@ def build_kernel(t: int = T, h: int = H, hg: int = HG, d: int = D, chunk: int = 
     return gdn_block
 
 
-def build_tensor_specs(t: int = T, h: int = H, hg: int = HG, d: int = D,
+def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, hg: int = HG, d: int = D,
                        chunk: int = CHUNK, weights: str | None = None):
     """Every weight the block reads, plus the delta rule's three constants."""
     import torch
@@ -361,10 +361,10 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=DEFAULT_TEST_SEQ_LEN)
     parser.add_argument("--weights", type=str, default=None,
                         help="a real layer from weights.py; default: random weights")
     parser.add_argument("--rounds", type=int, default=0,
@@ -387,7 +387,7 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
-        config=run_config(args.platform, args.device),
+        config=run_config(args.backend_type, args.device, args.execution_mode, t=args.seq_len),
         rtol=1e-2,
         atol=1e-5,
         compare_fn={"out": compare_out(args.seq_len, args.weights)},

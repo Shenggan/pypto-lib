@@ -6,7 +6,6 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: no-sim
 """Latency benchmark for the six GDN stages, and the block's other kernels on request.
 
 Times each stage on device over a sweep of sequence lengths, in one process: one
@@ -31,9 +30,7 @@ the host and is only affordable at small T.
     python models/qwen3_8_27b/bench.py -p a2a3 -d 0
     python models/qwen3_8_27b/bench.py -p a2a3 -d 0 --seq-len 4096,8192,16384
 
-There are no numbers to collect on a simulator -- the effective window comes
-from a span tree the simulators do not build -- so this file is marked
-`ci: no-sim` and CI runs it on device only.
+This is a manually invoked benchmark. Effective timings require a device.
 """
 import argparse
 import dataclasses
@@ -92,15 +89,17 @@ def _random_specs(stage, specs):
     return out
 
 
-def bench_stage(stage: str, t: int, platform: str, device: int,
-                rounds: int, warmup: int, data: str) -> dict:
+def bench_stage(stage: str, t: int, backend_type: str, device: int,
+                rounds: int, warmup: int, data: str, sim: bool = False) -> dict:
     """One compile and one timed loop. Returns the record for this (stage, shape)."""
     from golden import run
 
     mod = importlib.import_module(stage)
+    config = dict(backend_type=backend_type, execution_mode=sim, device_id=device)
     if stage in COMPOSED:
         fn = mod.build_kernel(t=t)
         specs = mod.build_tensor_specs(t=t)
+        config = mod.run_config(backend_type, device, sim, t=t)
     elif stage in BLOCK_KERNELS:
         fn = mod.build_kernel(t=t)
         specs = mod.build_tensor_specs(t=t)
@@ -117,8 +116,7 @@ def bench_stage(stage: str, t: int, platform: str, device: int,
         fn=fn,
         specs=specs,
         golden_fn=None,                       # timing only; correctness is each entry's own run
-        config=(mod.run_config(platform, device) if stage in COMPOSED
-                else dict(platform=platform, device_id=device)),
+        config=config,
     )
     rec = dict(stage=stage, t=t, h=H, hg=HG, d=D, chunk=CHUNK, rounds=rounds,
                warmup=warmup, data=data, ok=bool(result.passed),
@@ -138,8 +136,8 @@ def bench_stage(stage: str, t: int, platform: str, device: int,
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--backend", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seq-len", type=str,
                         default=",".join(str(x) for x in SEQ_LENS),
@@ -162,8 +160,8 @@ def main() -> int:
     records = []
     for t in seq_lens:
         for stage in stages:
-            rec = bench_stage(stage, t, args.platform, args.device,
-                              args.rounds, args.warmup, args.data)
+            rec = bench_stage(stage, t, args.backend_type, args.device,
+                              args.rounds, args.warmup, args.data, sim=args.execution_mode)
             records.append(rec)
             print(f"[bench] {stage:<16} T={t:<7} H={H:<3} Hg={HG:<3} "
                   f"mean={rec.get('mean_us', float('nan'))} us "
@@ -173,7 +171,8 @@ def main() -> int:
     print()
     print(format_table(records))
     if args.json:
-        payload = dict(platform=args.platform, device=args.device, d=D, chunk=CHUNK,
+        platform = f"{args.backend_type}sim" if args.execution_mode else args.backend_type
+        payload = dict(platform=platform, device=args.device, d=D, chunk=CHUNK,
                        rounds=args.rounds, warmup=args.warmup, data=args.data,
                        metric="effective_us", records=records)
         with open(args.json, "w") as fh:

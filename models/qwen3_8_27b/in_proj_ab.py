@@ -29,8 +29,8 @@ H = QWEN3_8_27B.linear_num_value_heads      # one scalar per value head, twice o
 
 MODULES = ("in_proj_a", "in_proj_b")
 
-# case shape
-T = 8192                # tokens (single sequence, B = 1)
+# validation
+DEFAULT_TEST_SEQ_LEN = 512
 
 # tiling
 M_TILE = 128            # token rows per block
@@ -39,7 +39,7 @@ K_TILE = 256            # contraction step; bf16 halves the useful K tile
 OUTPUTS = ("a_proj", "b_proj")      # bench.py reads it
 
 
-def build_kernel(t: int = T, k: int = K, h: int = H, inline: bool = False,
+def build_kernel(t: int = DEFAULT_TEST_SEQ_LEN, k: int = K, h: int = H, inline: bool = False,
                  m_tile: int = M_TILE, k_tile: int = K_TILE):
     """The operator at one shape. `inline` makes it a callee for `gdn_block`."""
     if t % m_tile or k % k_tile:
@@ -101,7 +101,7 @@ def _stacked_weight(weights: str | None):
     return load
 
 
-def build_tensor_specs(t: int = T, k: int = K, h: int = H, weights: str | None = None,
+def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, k: int = K, h: int = H, weights: str | None = None,
                        **_):
     import torch
     from golden import TensorSpec
@@ -152,10 +152,10 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=DEFAULT_TEST_SEQ_LEN)
     parser.add_argument("--weights", type=str, default=None,
                         help="a real layer from weights.py; default: random weights")
     parser.add_argument("--m-tile", type=int, default=M_TILE)
@@ -180,7 +180,7 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
-        config=dict(platform=args.platform, device_id=args.device),
+        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
         rtol=1e-3,
         atol=1e-5,
         compare_fn={"a_proj": compare("a_proj", args.seq_len, args.weights),

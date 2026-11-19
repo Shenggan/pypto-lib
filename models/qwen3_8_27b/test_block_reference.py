@@ -222,13 +222,6 @@ def check(t: int, w: dict[str, torch.Tensor], dtypes: list[torch.dtype],
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    # Accepted and ignored: this check is host-only, but CI invokes every runnable
-    # file in a model directory as `python <file> -p <platform> -d <card>`.
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"],
-                        help="accepted for CI's uniform invocation; nothing here runs on device")
-    parser.add_argument("-d", "--device", type=int, default=0,
-                        help="accepted for CI's uniform invocation; unused")
     parser.add_argument("--seq-len", type=int, default=1024,
                         help="the comparison is per-element, so a short sequence checks the "
                              "same thing; 8192 is the shape the numbers in the docs quote")

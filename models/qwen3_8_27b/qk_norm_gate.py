@@ -26,8 +26,8 @@ HG = QWEN3_8_27B.linear_num_key_heads       # QK heads: q and k
 D = QWEN3_8_27B.linear_value_head_dim       # head dimension, the norm's axis
 EPS = 1e-6                                  # inside the sqrt
 
-# case shape
-T = 8192                # tokens (single sequence, B = 1)
+# validation
+DEFAULT_TEST_SEQ_LEN = 512
 
 # tiling
 ROW_TILE = 64           # (token, head) rows per pipelined step of the norm
@@ -39,7 +39,7 @@ TOK_TILE = 256          # tokens per block of the gate
 SOFTPLUS_LINEAR = 20.0
 
 
-def build_kernel(t: int = T, h: int = H, hg: int = HG, d: int = D, eps: float = EPS,
+def build_kernel(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, hg: int = HG, d: int = D, eps: float = EPS,
                  inline: bool = False, row_tile: int = ROW_TILE, group: int = GROUP,
                  tok_tile: int = TOK_TILE):
     """The operator at one shape. `inline` makes it a callee for `gdn_block`."""
@@ -173,7 +173,7 @@ def _param(name: str, weights: str | None):
     return load
 
 
-def build_tensor_specs(t: int = T, h: int = H, hg: int = HG, d: int = D,
+def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, hg: int = HG, d: int = D,
                        chunk: int = 128, weights: str | None = None):
     import torch
     from golden import TensorSpec
@@ -224,10 +224,10 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=DEFAULT_TEST_SEQ_LEN)
     parser.add_argument("--weights", type=str, default=None,
                         help="a real layer from weights.py; default: random weights")
     parser.add_argument("--row-tile", type=int, default=ROW_TILE)
@@ -254,7 +254,7 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
-        config=dict(platform=args.platform, device_id=args.device),
+        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
         rtol=1e-3,
         atol=1e-5,
         compare_fn=compare_against_reference(args.seq_len, 128, args.weights),
