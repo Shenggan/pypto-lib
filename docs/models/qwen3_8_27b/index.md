@@ -1,8 +1,8 @@
 # Qwen3.8-27B
 
-`models/qwen3_8_27b/` implements the W8A8 Gated DeltaNet block, including
-checkpoint-compatible projections and separate convolution and recurrent
-state for each packed request.
+`models/qwen3_8_27b/` implements the W8A8 Gated DeltaNet block and decode
+layers for both Gated DeltaNet and gated attention. The composed decode
+entry uses resident convolution, recurrent and paged K/V caches.
 
 Qwen3.8-27B interleaves three Gated DeltaNet layers with one gated-attention
 layer, `LLLA` repeated sixteen times over 64 layers, so 48 of its layers run the
@@ -352,3 +352,32 @@ python models/qwen3_8_27b/test_block_reference.py --module-dtype float64,bfloat1
 The example commands invoke validation scripts directly. Device validation
 compiles and runs the kernel. The CPU block reference defaults to random
 weights and accepts an extracted layer for real-weight validation.
+
+## Composed decode serving entry
+
+`decode_fwd.build_kernel` composes consecutive groups of three GDN layers and one
+full-attention layer. The serving adapter uses all sixteen groups in one NPU
+submission, between the existing embedding and final-head programs. Inputs use
+stacked weights, layer-major state-row mappings and per-layer attention page
+tables; cache pools remain resident and inactive rows use private scratch slots.
+The caller must keep `group_start` and the selected group count within the stacked
+weight extent.
+
+The optional `active_rows` build argument restricts the existing GDN recurrence
+to a live prefix, while matrix and convolution stages keep their padded extent.
+Inactive recurrence outputs are zeroed and their state rows remain untouched.
+The default, zero, processes all padded rows. Serving selects one- and two-row
+variants with a two-head recurrence tile, and retains the padded decoder for
+larger active batches. Runtime argument shapes and cache ownership are unchanged.
+The standalone GDN block exposes `--active-rows` for reference validation.
+
+The composition reuses the decode layer operators without changing arithmetic or
+precision. Validation against the per-layer NPU path covers random and real
+weights, nonzero group offsets, the full 64-layer stack, all cache contents and
+untouched rows. The device validation configuration uses a padded
+batch of sixteen with two active requests on Ascend 910B2. Wider serving
+configurations need their own end-to-end validation.
+
+Dynamic-offset weight and descriptor views use explicit constant-size `pl.slice`
+calls. This preserves the child JIT argument shape on toolchains whose subscript
+metadata inference falls back to the full parent extent.

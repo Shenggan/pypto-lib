@@ -223,6 +223,34 @@ def check_resumed_fetch_verifies_content() -> None:
         assert weights._verified_locally(shard, len(body), digest)
 
 
+def check_reference_consumes_prepared_weights() -> None:
+    """The loader's output must reach the reference with no adapter in between.
+
+    ``test_model_reference.py`` gates the maths, but it feeds the reference a
+    Transformers state dict, where every projection is a plain float tensor.
+    The deployed checkpoint is not: eight of each layer's projections arrive as
+    INT8 plus a separate flattened ``weight_scale``. Nothing else exercises
+    that pairing, so a renamed scale or a changed ``dequantize`` indexing would
+    break the real load path while every other host check stayed green.
+    """
+    contract = make_text_contract(tiny_config())
+    with tempfile.TemporaryDirectory(prefix="qwen38_w8a8_ref_") as directory:
+        root = Path(directory)
+        _write_fixture(root, contract)
+        prepared = weights.load_text_weights(root, contract=contract)
+
+        quantized = [name for name, value in prepared.items() if value.dtype == torch.int8]
+        assert quantized, "the fixture produced no INT8 weights, so this proves nothing"
+        for name in quantized:
+            scale = prepared[name.removesuffix(".weight") + ".weight_scale"]
+            assert scale.ndim == 1, f"{name}: dequantize indexes a flat [out] scale, got {tuple(scale.shape)}"
+
+        ids = reference.make_text_inputs(6, tiny_config(), seed=1)
+        out = reference.text_prefill(ids, prepared, tiny_config(), chunk=4)
+        assert tuple(out["logits"].shape) == (6, tiny_config().vocab_size)
+        assert torch.isfinite(out["logits"]).all()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3",
@@ -239,6 +267,7 @@ def main() -> int:
     check_quantization_recipe()
     check_loader()
     check_resumed_fetch_verifies_content()
+    check_reference_consumes_prepared_weights()
     print("PASS: Qwen3.8 weight loader and text contract")
     return 0
 
