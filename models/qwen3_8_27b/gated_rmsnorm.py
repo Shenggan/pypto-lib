@@ -15,8 +15,7 @@
 
 The two bf16 narrowings are the model's own cast sequence
 (`Qwen3_5RMSNormGated`): fp32 variance and rsqrt, narrow to the model dtype,
-weight applied there, gate applied in fp32. `quant=False` ends in that dtype
-instead of the INT8 epilogue.
+weight applied there, gate applied in fp32.
 """
 import pypto.language as pl
 
@@ -42,17 +41,12 @@ TOK_TILE = 16           # tokens per block; 16 scalar scale writes fill one 64-b
 
 # `y_scale` is a [1, T] row and not a [T] vector: `out_proj` reshapes its slice
 # to the [M, 1] column it multiplies by, and a tile store must be 2-D anyway.
-OUTPUTS = ("y_q", "y_scale")        # int8 variant; bench.py reads it
+OUTPUTS = ("y_q", "y_scale")
 
 
 def build_kernel(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, d: int = D, eps: float = EPS,
-                 inline: bool = False, quant: bool = True):
-    """The operator at one shape. `inline` makes it a callee for `gdn_block`.
-
-    The two variants are two functions because a `@pl.jit` body can neither
-    branch on a Python flag nor call a helper; the per-token arithmetic is the
-    same text in both, up to the last cast.
-    """
+                 inline: bool = False):
+    """Build gated RMSNorm with per-token INT8 quantization."""
     # A block walks one TOK_TILE of rows, so a token count that does not divide it
     # leaves the tail silently unwritten -- the same trap `quant_x` and `short_conv`
     # refuse. The composed block rejects such shapes earlier; this covers the
@@ -124,36 +118,7 @@ def build_kernel(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, d: int = D, eps: flo
                 y_q[r0 : r0 + 1, :] = pl.reshape(q_i8, [1, h * d])
         return y_q
 
-    @jit
-    def gdn_gated_rmsnorm_bf16(
-        o: pl.Tensor[[t, h, d], pl.FP16],
-        z: pl.Tensor[[t, h * d], pl.BF16],
-        norm_w: pl.Tensor[[d], pl.BF16],
-        y: pl.Out[pl.Tensor[[t, h * d], pl.BF16]],
-    ):
-        o_flat = pl.reshape(o, [t, h * d])
-        for blk in pl.spmd(t // TOK_TILE, name_hint="gated_rmsnorm_bf16"):
-            t0 = blk * TOK_TILE
-            w_row = pl.cast(pl.reshape(norm_w[:], [1, d]), target_type=pl.FP32)
-            for i in pl.pipeline(TOK_TILE, stage=2):
-                r0 = t0 + i
-                of_run = pl.cast(o_flat[r0 : r0 + 1, :], target_type=pl.FP32)
-                of = pl.reshape(of_run, [h, d])
-                inv_rms = pl.rsqrt(pl.add(pl.mul(pl.row_sum(pl.mul(of, of)), 1.0 / d), eps),
-                                   high_precision=True)
-                normed_bf = pl.cast(pl.row_expand_mul(of, inv_rms), target_type=pl.BF16, mode="rint")
-                normed = pl.cast(normed_bf, target_type=pl.FP32)
-                weighted_bf = pl.cast(pl.col_expand_mul(normed, w_row), target_type=pl.BF16, mode="rint")
-
-                zf_run = pl.cast(z[r0 : r0 + 1, :], target_type=pl.FP32)
-                zf = pl.reshape(zf_run, [h, d])
-                gate = pl.div(zf, pl.add(pl.exp(pl.neg(zf)), 1.0))
-                y_bf = pl.cast(pl.mul(pl.cast(weighted_bf, target_type=pl.FP32), gate),
-                               target_type=pl.BF16, mode="rint")
-                y[r0 : r0 + 1, :] = pl.reshape(y_bf, [1, h * d])
-        return y
-
-    return gdn_gated_rmsnorm if quant else gdn_gated_rmsnorm_bf16
+    return gdn_gated_rmsnorm
 
 
 gdn_gated_rmsnorm = build_kernel()
@@ -193,13 +158,6 @@ def golden_gdn_gated_rmsnorm(tensors):
     tensors["y_scale"].copy_(scale.reshape(1, -1))
 
 
-def golden_gdn_gated_rmsnorm_bf16(tensors):
-    import torch
-
-    y = golden_y(tensors["o"], tensors["z"], tensors["norm_w"])
-    tensors["y"].copy_(y.to(torch.bfloat16))
-
-
 def gated_rmsnorm_ref(o, z, weight, eps: float = EPS):
     """Float64 RMSNorm per head followed by the SiLU gate."""
     import torch
@@ -213,7 +171,7 @@ def gated_rmsnorm_ref(o, z, weight, eps: float = EPS):
 
 
 def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, d: int = D,
-                       weights: str | None = None, quant: bool = True):
+                       weights: str | None = None):
     import torch
     from golden import TensorSpec
 
@@ -232,17 +190,13 @@ def build_tensor_specs(t: int = DEFAULT_TEST_SEQ_LEN, h: int = H, d: int = D,
             return torch.ones(d, dtype=torch.bfloat16)
         return load_layer(weights)["norm.weight"]
 
-    specs = [
+    return [
         TensorSpec("o", [t, h, d], torch.float16, init_value=output),
         TensorSpec("z", [t, h * d], torch.bfloat16, init_value=gate_input),
         TensorSpec("norm_w", [d], torch.bfloat16, init_value=norm_weight),
+        TensorSpec("y_q", [t, h * d], torch.int8),
+        TensorSpec("y_scale", [1, t], torch.float32),
     ]
-    if quant:
-        specs += [TensorSpec("y_q", [t, h * d], torch.int8),
-                  TensorSpec("y_scale", [1, t], torch.float32)]
-    else:
-        specs += [TensorSpec("y", [t, h * d], torch.bfloat16)]
-    return specs
 
 
 def compare_y_q():
@@ -280,7 +234,7 @@ if __name__ == "__main__":
     import os
     import statistics
 
-    from golden import ratio_allclose, run
+    from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
@@ -290,8 +244,6 @@ if __name__ == "__main__":
     parser.add_argument("--heads", type=int, default=H, help="value heads H")
     parser.add_argument("--weights", type=str, default=None,
                         help="a real layer from weights.py; default: random weights")
-    parser.add_argument("--bf16-out", action="store_true", default=False,
-                        help="the bf16-output variant, to price the int8 epilogue")
     parser.add_argument("--rounds", type=int, default=0,
                         help="also time the kernel over this many rounds (device only)")
     parser.add_argument("--save-data", action="store_true", default=False)
@@ -305,25 +257,23 @@ if __name__ == "__main__":
         os.environ["PYPTO_BENCH_ROUNDS"] = str(args.rounds)
         os.environ["PYPTO_BENCH_WARMUP"] = "5"
 
-    quant = not args.bf16_out
     result = run(
-        fn=build_kernel(t=args.seq_len, h=args.heads, quant=quant),
-        specs=build_tensor_specs(t=args.seq_len, h=args.heads, weights=args.weights, quant=quant),
-        golden_fn=golden_gdn_gated_rmsnorm if quant else golden_gdn_gated_rmsnorm_bf16,
+        fn=build_kernel(t=args.seq_len, h=args.heads),
+        specs=build_tensor_specs(t=args.seq_len, h=args.heads, weights=args.weights),
+        golden_fn=golden_gdn_gated_rmsnorm,
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
         config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
         rtol=1e-3,
         atol=1e-5,
-        compare_fn=({"y_q": compare_y_q()} if quant
-                    else {"y": ratio_allclose(atol=3e-3, rtol=3e-3, max_error_ratio=0.02)}),
+        compare_fn={"y_q": compare_y_q()},
         compile_only=args.compile_only,
     )
     if args.rounds and result.bench is not None:
         samples = [s for s in result.bench.per_round("effective") if s > 0]
         if samples:
-            print(f"[bench] gated_rmsnorm{'' if quant else '_bf16'} T={args.seq_len} H={args.heads} "
+            print(f"[bench] gated_rmsnorm T={args.seq_len} H={args.heads} "
                   f"rounds={len(samples)} mean={statistics.fmean(samples):.1f} us "
                   f"median={statistics.median(samples):.1f} min={min(samples):.1f} "
                   f"max={max(samples):.1f}", flush=True)
