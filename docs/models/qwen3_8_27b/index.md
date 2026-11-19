@@ -177,16 +177,17 @@ re-measured 9378 us mean over 50 rounds on a later one.
 Most of it is at the head, where `in_proj_ab`, the halo fill, the gate half of
 `qk_norm_gate` and `chunk_cumsum` all run underneath `quant_x` for free.
 
-**Accuracy is scored as two ratios against the quantization floor, not as an
-element-wise tolerance**, because `out_proj` reads int8. The kernels' own
-dtypes move the normed output by 2.6e-03, that flips 1.0% of its int8 values
-by one step, and those flips alone move the block output by 1.4e-02 -- so an
+**Accuracy is scored in units of the quantization floor.** `out_proj` reads
+int8, and the kernels' own dtypes move the normed output by 2.6e-03. That shifts
+1.0% of its int8 values by one step and moves the block output by 1.4e-02. An
 element-wise comparison taken after a quantiser measures which side of a
 rounding boundary a value fell on, not whether the kernel is right. The gate
 is instead: total relative error within 1.05x of what W8A8 alone costs, and
 worst token row within 1.25x. Measured **1.006x and 1.002x**, with the worst
 row the sharper of the two -- one dead row in 2048 moves the whole-tensor norm
-by 1.12x and the worst row by 10.6x.
+by 1.12x and the worst row by 10.6x. The distance to the fake-quant golden is
+also limited to 1.00x of the floor over the whole tensor and 1.50x on the worst
+token row.
 
 Still out of scope here: variable-length batches (one sequence, `B = 1`), and
 everything in the layer outside the Gated DeltaNet block itself.
@@ -366,6 +367,11 @@ python models/qwen3_8_27b/chunk_h.py -p a2a3 --sim
 PYPTO_BENCH=1 python models/qwen3_8_27b/gdn_layer.py -p a2a3 -d 0 --seq-len 8192
 python models/qwen3_8_27b/bench.py -p a2a3 -d 0 --seq-len 8192
 ```
+
+Use `gdn_block.py --save-data` to capture inputs and the fake-quant golden.
+`--golden-data <data-dir>` compares against that saved output and computes the
+quantization floor from the replayed inputs. Pass the same `--seq-len` and, for
+checkpoint runs, the original floating-point `--weights` file.
 
 Run `bench.py`, `test_block_reference.py`, and `weights.py` manually. The
 block reference check runs on CPU with `transformers` (5.17.0) and skips with
