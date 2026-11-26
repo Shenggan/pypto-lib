@@ -1060,6 +1060,29 @@ def append_kv_pages(k_pages: torch.Tensor, v_pages: torch.Tensor,
         v_pages[row] = v_new[i].to(v_pages.dtype)
 
 
+def write_kv_pages(k_pages: torch.Tensor, v_pages: torch.Tensor, block_table: torch.Tensor,
+                   k_new: torch.Tensor, v_new: torch.Tensor, start_pos: int,
+                   page_size: int, seq: int = 0) -> None:
+    """Write a prefill chunk's K and V into one sequence's pages, in place.
+
+    The prefill counterpart of :func:`append_kv_pages`: that one places a single token
+    per sequence, this one places `k_new.shape[0]` consecutive tokens of one sequence,
+    beginning at absolute position `start_pos`. The rows come from
+    :func:`kv_page_rows`, so this writes exactly where :func:`decode_gqa_attention`
+    will read -- which is the whole correctness content of the prefill cache write.
+
+    `start_pos` must be page-aligned. The runner's packing pads every row to a multiple
+    of 256 tokens and the page is 128, so a chunk boundary is page-aligned by contract;
+    an unaligned one would split the first page between two writers.
+    """
+    tokens = k_new.shape[0]
+    if start_pos % page_size:
+        raise ValueError(f"start_pos {start_pos} is not a multiple of the page {page_size}")
+    rows = kv_page_rows(block_table, seq, start_pos + tokens, page_size)[start_pos:]
+    k_pages[rows] = k_new.to(k_pages.dtype)
+    v_pages[rows] = v_new.to(v_pages.dtype)
+
+
 def gated_attention(x: torch.Tensor, w: dict[str, torch.Tensor], cfg: Qwen38Config,
                     prefix: str, position_ids: torch.Tensor) -> dict[str, torch.Tensor]:
     """One causal Qwen3.8 gated-attention mixer on a single text sequence.

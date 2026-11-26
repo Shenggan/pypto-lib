@@ -1,8 +1,9 @@
 # Qwen3.8-27B
 
-`models/qwen3_8_27b/` implements the W8A8 Gated DeltaNet block and decode
-layers for both Gated DeltaNet and gated attention. The composed decode
-entry uses resident convolution, recurrent and paged K/V caches.
+`models/qwen3_8_27b/` implements W8A8 Gated DeltaNet and gated-attention
+operators, decoder layers, and text prefill/decode entries. Packed prefill
+uses separate convolution/recurrent state rows and paged K/V ownership for
+each request. Model and serving integration remain under development.
 
 Qwen3.8-27B interleaves three Gated DeltaNet layers with one gated-attention
 layer, `LLLA` repeated sixteen times over 64 layers, so 48 of its layers run the
@@ -29,6 +30,35 @@ Grouped-query attention is the shape that matters here: value head `h` reads key
 head `h // 3`. q and k carry 16 heads; v, beta, the gate, the state and the
 output are per value head.
 
+## Serving interface
+
+As in the DeepSeek model, pypto-lib owns the L3/HOST entries and the kernel
+capability manifest. Serving supplies runtime dimensions and buffers; it does
+not redefine the kernel signatures. Qwen's factories specialize the fixed
+prefill extent, owner count, decode batch and resident cache extents:
+
+| Module | Entry factory | Computation |
+| --- | --- | --- |
+| [prefill_text_fwd.py](../../../models/qwen3_8_27b/prefill_text_fwd.py) | `build_l3_kernel(t, rows=..., max_pages=..., kv_layer_stride=..., state_count=...)` | Packed text prefill, selected logits and updated caches |
+| [decode_fwd.py](../../../models/qwen3_8_27b/decode_fwd.py) | `build_l3_kernel(batch, max_pages=..., kv_rows=..., state_count=..., active_rows=...)` | Decoder layers over stacked weights and layer-specific cache descriptors |
+| [embedding.py](../../../models/qwen3_8_27b/embedding.py) | `build_l3_kernel(batch)` | Token embedding |
+| [rms_lm_head.py](../../../models/qwen3_8_27b/rms_lm_head.py) | `build_l3_kernel(batch)` | Final normalization and vocabulary logits |
+
+Each factory returns a `pl.jit.host` entry calling the existing L2 compute
+implementation. The forward entries declare convolution, recurrent and K/V
+cache tensors as `pl.InOut`; serving keeps these buffers device-resident.
+Weights stack on the row axis in global-layer order for common tensors,
+GDN-layer order for linear-attention tensors, and attention-layer order for
+full-attention tensors. The caller owns request metadata and cache allocation.
+
+[serving_contract.py](../../../models/qwen3_8_27b/serving_contract.py) is
+importable without PyPTO and describes scheduling and shape limits. It requires
+exact fused prefill extents: padding must not update a live recurrent state.
+Fused extents are multiples of 2048 tokens, up to 32768, and each packed owner
+contributes spans aligned to 256 tokens. Decode batches are padded to a multiple
+of 16, at most 128 rows. These are implementation limits; the complete serving
+path has been validated at a 2048-token extent with two concurrent requests.
+
 ## The operators
 
 The layer's core is the chunked delta rule, split the way the reference
@@ -54,6 +84,7 @@ the block runs them.
 | [out_proj.py](../../../models/qwen3_8_27b/out_proj.py) | the normed output back to the residual stream, BF16 both sides |
 | [gdn_layer.py](../../../models/qwen3_8_27b/gdn_layer.py) | the delta rule's six stages as one program |
 | [gdn_block.py](../../../models/qwen3_8_27b/gdn_block.py) | all fourteen as one program, hidden states in and out |
+| [prefill_layer.py](../../../models/qwen3_8_27b/prefill_layer.py) | a whole decoder layer over a prefill chunk, either mixer, with both residual adds and the MLP |
 
 The two A8W8 projections are the same arithmetic at two shapes and share
 one implementation, [a8w8_linear.py](../../../models/qwen3_8_27b/a8w8_linear.py);
@@ -126,6 +157,48 @@ registers the same row.
 
 Packed GDN uses separate convolution halos and recurrent state rows for each
 request. The caller provides the row boundaries and cache owners.
+
+## The decoder layer
+
+[prefill_layer.py](../../../models/qwen3_8_27b/prefill_layer.py) wraps either
+mixer in the rest of a decoder layer: the input norm, the mixer, the
+post-attention norm and the MLP. Each norm is `rmsnorm`'s fused add-and-norm,
+which reads the running residual and the previous stage's delta and writes both
+the new residual and the normed stream, so **the layer boundary sits one
+addition behind the module boundary**: `(residual, delta)` in,
+`(residual_out, mlp_out)` out. The residual runs in FP32 and everything else in
+BF16 -- bf16 has eight mantissa bits, and a 64-layer accumulation would spend
+half of them. `--kind gdn` composes `gdn_block`, `--kind attn` composes
+`gated_attention`, and both are gated against `reference.residual_layer`, which
+takes the mixer as a callable and serves the decode path too.
+
+Standalone layer validation defaults to 512 tokens for GDN and 256 tokens for
+attention. Packed GDN retains the 2048-token alignment.
+
+**The chunk a layer accepts, and what it costs** (a2a3, one card, one grant, a
+real layer's weights resident, five rounds after two warmup, median):
+
+| tokens | ring 1 | GDN layer | per token | attention layer | per token |
+|---|---|---|---|---|---|
+| 2048 | 4 GiB | | | 4.83 ms | 2.358 us |
+| 8192 | 4 GiB | 19.56 ms | 2.388 us | 19.73 ms | 2.409 us |
+| 16384 | 8 GiB | 40.41 ms | 2.467 us | 49.84 ms | 3.042 us |
+| 32768 | 16 GiB | 82.27 ms | 2.511 us | 139.27 ms | 4.250 us |
+| 65536 | 32 GiB | 171.03 ms | 2.610 us | 487.82 ms | 7.443 us |
+| 98304 | 32 GiB | 258.08 ms | 2.625 us | | |
+
+The attention layer needs less: 4 GiB carries it to 16384 and 8 GiB to 32768.
+Each heap above 4 GiB in that table was taken because the half-size heap
+**failed mid-run** -- as a generic AICPU exception, not as an allocation error,
+so a short ring heap looks like a device fault. `ring_heap` is per ring and must
+be a power of two, so the four-entry list raises ring 1 alone and leaves the
+other three at their defaults; 98304 was not probed below 32 GiB, and 4 GiB is
+the entry's own default rather than a measured floor.
+
+The GDN layer is **linear** in the token count, 2.39 to 2.63 us per token over a
+twelvefold range, and the attention layer is **quadratic**, 2.36 to 7.44. The
+chunk is therefore chosen by the attention path and by what the ring heap leaves
+for the resident weights, not by the GDN path.
 
 ## The short convolution
 
@@ -230,6 +303,86 @@ full kernel, so that gap is the cube schedule under a 128x128 output tile, not
 the epilogue. Accuracy: each GEMM sits 1.7e-03 from the float64 W8A8 chain it
 implements -- bf16 output rounding and nothing else -- and the quantisation is
 the whole of the rest.
+
+## Packed prefill
+
+[prefill_fwd.py](../../../models/qwen3_8_27b/prefill_fwd.py) composes three GDN
+layers and one full-attention layer per group. Its packed requests share
+weights and token-local projections, with separate sequence boundaries and
+cache owners. [prefill_text_fwd.py](../../../models/qwen3_8_27b/prefill_text_fwd.py)
+adds embedding lookup and scores the final token of each packed request.
+Both forward entries default to one four-layer group at 2048 tokens.
+Use `--groups 2` to check weight and cache indices across groups.
+
+The stack takes these INT32 descriptors, where `R` is the number of requests:
+
+| Argument | Shape | Meaning |
+| --- | --- | --- |
+| `row_base` | `[T]` | First packed token index of the token's request |
+| `row_owner` | `[T]` | Request index for each token |
+| `row_ends` | `[R]` | Exclusive packed end of each request |
+| `state_rows` | `[gdn_layers * R]` | Pool row at `layer * R + owner`, shared by convolution and recurrent state |
+| `page_bases` | `[R]` | Number of cached 128-token pages before each current request chunk |
+| `visible_pages` | `[R]` | Cached plus current pages for each request |
+| `block_table` | `[R, max_pages]` | Logical-to-physical KV page map for each request |
+
+`kv_layer_stride` gives the physical pool rows between attention layers. State
+rows must be distinct across active layer/request pairs; current KV writes
+must not overlap another request's pages. Fresh requests need zero incoming
+GDN state. Resumed requests supply their own convolution halo, recurrent state,
+KV prefix, and absolute-position RoPE tables.
+
+Current request lengths and cached prefixes must align to 256 tokens. The
+total packed extent must be a multiple of 2048 tokens for the projection
+schedule. Padding tokens through GDN updates state, so callers must handle
+remainders through decode until valid-token masking is supported.
+
+These cases use 256 and 1792-token requests at T = 2048. A page base of 4
+resumes a request after 512 cached tokens; `--resume` initializes that
+request's GDN state as well. Run them on a device assigned by the site's
+allocator:
+
+```bash
+python models/qwen3_8_27b/prefill_fwd.py -p a2a3 -d "$TASK_DEVICE" --packed --groups 1
+python models/qwen3_8_27b/prefill_fwd.py -p a2a3 -d "$TASK_DEVICE" --packed --groups 1 --page-bases 0,4 --resume
+python models/qwen3_8_27b/prefill_text_fwd.py -p a2a3 -d "$TASK_DEVICE" --packed --groups 1 --page-bases 0,4 --resume
+python models/qwen3_8_27b/prefill_fwd.py -p a2a3 -d "$TASK_DEVICE" --packed --groups 2 --page-bases 2,4 --resume
+python models/qwen3_8_27b/prefill_text_fwd.py -p a2a3 -d "$TASK_DEVICE" --packed --groups 2 --page-bases 0,4 --resume
+python models/qwen3_8_27b/prefill_text_fwd.py -p a2a3 -d "$TASK_DEVICE" --packed --groups 16 --page-bases 0,4 --resume
+```
+
+The oracle runs each request independently through the float64 and fake-quant
+stack chains. Gates check each request's output streams and each layer/request
+cache region against its own quantization floor, preserve untouched pool rows
+exactly, and exercise the following decode consumer. Projected K/V values use
+numerical tolerances. The text gate scores only the first `valid_rows` logit
+rows; the kernel leaves the padded tail undefined.
+
+The four-layer cases, the eight-layer resumed stack and mixed text cases,
+and the full 64-layer mixed text case pass these gates on a2a3 with synthetic
+weights. The full-depth gate covers both requests' final-token logits, both
+streams, every cache layer/owner, and subsequent decode consumers. This does
+not establish real-checkpoint serving correctness or served performance.
+
+The text entry uses `text_ring_heap(T)` for its runtime buffers. At multiple
+groups, the retained loop places whole-layer buffers on ring 3; the helper
+sizes it with the same layer budget as rings 1 and 2. Larger text chunks need
+their own capacity and correctness checks.
+
+The pypto-serving Qwen3.8 runner packs complete 256-token request spans into
+these launches, maps owner-major physical state slots to the kernel's
+layer-major descriptors, and restores logits to batch order. Unaligned
+positions and tails use decode without synthetic padding. Its full-depth
+two-request fused path passes two a2a3 NPU runs against both saved oracle
+sets, including output streams, caches and host decode consumers. That gate
+uses synthetic weights and resets cache pools between runs. A separate
+real-checkpoint serving suite matches vLLM-ascend v0.23.0 on four raw prompts
+of 5, 5, 2048 and 2050 tokens, with eight greedy outputs each over two repeats:
+all 64 generated token IDs match. It uses two sequences, context 4096,
+2048-token scheduling, 128-token pages and disabled prefix caching. The
+FP32 solve passes its unchanged pointwise and Frobenius gates, including a
+correlated-key regression. Performance against the default vendor configuration
+must be remeasured after kernel changes.
 
 ## Validating and benchmarking
 
@@ -341,4 +494,5 @@ validation.
 
 The composition reuses the decode layer operators without changing arithmetic or
 precision, so this model's numbers are validated per layer rather than over the
-stack.
+stack. Full-logit and serving checks cover reordered owners, slot reuse and
+exact-token prefill tails.
